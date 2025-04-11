@@ -1,0 +1,141 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import yfinance as yf
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from pypfopt import EfficientFrontier, risk_models
+from newsapi import NewsApiClient
+
+# Fetch stock data from yfinance
+def fetch_stock_data(ticker, start_date, end_date):
+    stock = yf.Ticker(ticker)
+    df = stock.history(start=start_date, end=end_date)
+    df["Returns"] = df["Close"].pct_change()
+    df["SMA_20"] = df["Close"].rolling(window=20).mean()
+    df["RSI"] = compute_rsi(df["Close"], 14)
+    df["Volatility"] = df["Returns"].rolling(window=20).std()
+    df["Target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+    df = df.dropna()
+    return df[["Close", "Returns", "SMA_20", "RSI", "Volatility", "Target"]], stock.info
+
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# Fetch sentiment data from NewsAPI
+def fetch_news_sentiment(api_key, keywords, ticker, start_date, end_date):
+    newsapi = NewsApiClient(api_key=api_key)
+    analyzer = SentimentIntensityAnalyzer()
+    sentiment_scores = {}
+    current_date = start_date
+    while current_date <= end_date:
+        try:
+            articles = newsapi.get_everything(
+                q=f"{ticker} OR {' OR '.join(keywords)}",
+                from_param=current_date.strftime("%Y-%m-%d"),
+                to=current_date.strftime("%Y-%m-%d"),
+                language="en"
+            )["articles"]
+            scores = [analyzer.polarity_scores(a["description"] or "")["compound"] for a in articles]
+            sentiment_scores[current_date.strftime("%Y-%m-%d")] = np.mean(scores) if scores else 0
+        except:
+            sentiment_scores[current_date.strftime("%Y-%m-%d")] = 0
+        current_date += timedelta(days=1)
+    return sentiment_scores
+
+# Train machine learning model for stock prediction
+def train_model(ticker, start_date, end_date, api_key, keywords):
+    df, info = fetch_stock_data(ticker, start_date, end_date)
+    sentiment_scores = fetch_news_sentiment(api_key, keywords, ticker, 
+                                          pd.to_datetime(start_date), pd.to_datetime(end_date))
+    df["Sentiment"] = df.index.map(lambda x: sentiment_scores.get(x.strftime("%Y-%m-%d"), 0))
+    X = df[["Returns", "SMA_20", "RSI", "Volatility", "Sentiment"]]
+    y = df["Target"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = GradientBoostingClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    accuracy = accuracy_score(y_test, model.predict(X_test))
+    return model, accuracy, info, df["Close"]
+
+# Optimize portfolio based on expected returns and covariance matrix
+def optimize_portfolio(tickers, prices, expected_returns, cov_matrix):
+    try:
+        ef = EfficientFrontier(expected_returns, cov_matrix, weight_bounds=(0, 0.3))
+        ef.max_sharpe()
+        weights = ef.clean_weights()
+        return {ticker: round(w, 3) for ticker, w in weights.items() if w > 0}
+    except Exception as e:
+        print(f"Optimization error: {e}")
+        return {ticker: 1/len(tickers) for ticker in tickers}  # Fallback to equal weights
+
+# Streamlit UI
+st.set_page_config(page_title="Bells Code", layout="centered")
+st.title("Bells Code - Stock Recommendations")
+
+api_key = st.text_input("Enter your NewsAPI key:", "")  # Get NewsAPI key from user
+tickers = st.text_input("Enter stock tickers (comma separated):", "AAPL,TSLA,JPM").split(",")
+keywords = st.text_input("Enter sentiment keywords (comma separated):", "tariff,election,regulation,inflation").split(",")
+
+if st.button("Run Analysis"):
+    if not api_key:
+        st.error("Please provide a valid NewsAPI key.")
+    else:
+        st.write("Analyzing stocks...")
+        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        end_date = datetime.now().strftime("%Y-%m-%d")
+
+        recommendations = []
+        models = {}
+        closes = {}
+        pred_returns = {}
+        latest_prices = {}
+
+        for ticker in tickers:
+            ticker = ticker.strip().upper()
+            model, accuracy, info, close_series = train_model(ticker, start_date, end_date, api_key, keywords)
+            models[ticker] = model
+            closes[ticker] = close_series
+
+            # Prediction logic
+            df, _ = fetch_stock_data(ticker, 
+                                    (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"), 
+                                    end_date)
+            sentiment_scores = fetch_news_sentiment(api_key, keywords, ticker, 
+                                                    datetime.now() - timedelta(days=1),
+                                                    datetime.now())
+            latest_date = df.index[-1].strftime("%Y-%m-%d")
+            sentiment = sentiment_scores.get(latest_date, 0)
+            latest_data = df.iloc[-1][["Returns", "SMA_20", "RSI", "Volatility"]]
+            features = pd.DataFrame([latest_data])
+            features["Sentiment"] = sentiment
+
+            prob = model.predict_proba(features)[0][1]
+            pe_ratio = info.get("trailingPE", float("inf"))
+            price = df["Close"].iloc[-1]
+
+            if prob > 0.7 and pe_ratio < 30:
+                recommendations.append({
+                    "ticker": ticker,
+                    "confidence": prob,
+                    "price": price,
+                    "sector": info.get("sector", "Unknown"),
+                    "pe": pe_ratio
+                })
+                pred_returns[ticker] = prob * 0.02 - (1 - prob) * 0.01
+                latest_prices[ticker] = price
+
+        if recommendations:
+            weights = optimize_portfolio([r["ticker"] for r in recommendations], closes, pred_returns)
+            st.subheader("Recommended Portfolio:")
+            for r in recommendations:
+                weight = weights.get(r["ticker"], 0)
+                st.write(f"**{r['ticker']}** ({r['sector']}): Buy at ${r['price']:.2f} | Confidence: {r['confidence']:.2%} | P/E: {r['pe']:.1f} | Weight: {weight*100:.1f}%")
+        else:
+            st.write("No strong buy recommendations at this time.")
